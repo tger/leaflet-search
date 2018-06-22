@@ -97,6 +97,7 @@ L.Control.Search = L.Control.extend({
 			}
 		}
 	},
+	},
 
 	_getPath: function(obj, prop) {
 		var parts = prop.split('.'),
@@ -396,7 +397,10 @@ L.Control.Search = L.Control.extend({
 	//////end DOM creations
 
 	_getUrl: function(text) {
-		return (typeof this.options.url === 'function') ? this.options.url(text) : this.options.url;
+		var url = this.options.geocoder ?
+				this.options.geocoders[this.options.geocoder].url :
+				options.url;
+		return (typeof url === 'function') ? url(text) : url;
 	},
 
 	_defaultFilterData: function(text, records) {
@@ -422,8 +426,6 @@ L.Control.Search = L.Control.extend({
 	},
 
 	showTooltip: function(records) {
-		
-
 		this._countertips = 0;
 		this._tooltip.innerHTML = '';
 		this._tooltip.currentSelection = -1;  //inizialized for _handleArrowSelect()
@@ -491,7 +493,7 @@ L.Control.Search = L.Control.extend({
 		return { abort: function() { script.parentNode.removeChild(script); } };
 	},
 
-	_recordsFromAjax: function(text, callAfter) {	//Ajax request
+	_recordsFromAjax: function(text, callAfter, timeout, callOnError) {	//Ajax request
 		if (window.XMLHttpRequest === undefined) {
 			window.XMLHttpRequest = function() {
 				try { return new ActiveXObject("Microsoft.XMLHTTP.6.0"); }
@@ -503,23 +505,34 @@ L.Control.Search = L.Control.extend({
 		}
 		var IE8or9 = ( L.Browser.ie && !window.atob && document.querySelector ),
 			request = IE8or9 ? new XDomainRequest() : new XMLHttpRequest(),
-			url = L.Util.template(this._getUrl(text), {s: text});
+			url = L.Util.template(this._getUrl(text), {s: encodeURIComponent(text)});
+
+		// Force use of HTTP for protocol-neutral url if we run locally
+		if (url.indexOf('//') == 0 && document.location.href.indexOf('file://') == 0)
+			url = 'http:'+url;
 
 		//rnd = '&_='+Math.floor(Math.random()*10000);
 		//TODO add rnd param or randomize callback name! in recordsFromAjax			
 		
-		request.open("GET", url);
+		request.open("GET", url, true);
 		
-
 		request.onload = function() {
 			callAfter( JSON.parse(request.responseText) );
 		};
+		request.onerror = function() {
+			if (callOnError)
+				callOnError(request.statusText);
+		};
 		request.onreadystatechange = function() {
-		    if(request.readyState === 4 && request.status === 200) {
+		    if(request.readyState === XMLHttpRequest.DONE) {
+		    	if (request.status === 200)
 		    	this.onload();
+		    	else
+		    		this.onerror();
 		    }
 		};
 
+		request.timeout = timeout || 10000;
 		request.send();
 		return request;   
 	},
@@ -537,7 +550,7 @@ L.Control.Search = L.Control.extend({
         loc.layer = layer;
         retRecords[ self._getPath(layer.options,propName) ] = loc;
       }
-      else if(self._getPath(layer.feature.properties,propName))
+      else if(layer.feature && self._getPath(layer.feature.properties,propName))
       {
         loc = layer.getLatLng();
         loc.layer = layer;
@@ -702,7 +715,6 @@ L.Control.Search = L.Control.extend({
 				{
 					clearTimeout(this.timerKeypress);	//cancel last search request while type in				
 					this.timerKeypress = setTimeout(function() {	//delay before request, for limit jsonp/ajax request
-
 						self._fillRecordsCache();
 					
 					}, this.options.delayType);
@@ -730,15 +742,15 @@ L.Control.Search = L.Control.extend({
 	_fillRecordsCache: function() {
 
 		var self = this,
-			inputText = this._input.value, records;
+				inputText = this._input.value,
+				records;
 
 		if(this._curReq && this._curReq.abort)
-			this._curReq.abort();
-		//abort previous requests
+			this._curReq.abort(); //abort previous requests
 
 		L.DomUtil.addClass(this._container, 'search-load');	
 
-		if(this.options.layer)
+		if(this.options.layer)			// Layer data?
 		{
 			//TODO _recordsFromLayer must return array of objects, formatted from _formatData
 			this._recordsCache = this._recordsFromLayer();
@@ -747,31 +759,65 @@ L.Control.Search = L.Control.extend({
 
 			this.showTooltip( records );
 
+			if (!this.options.geocoder)
 			L.DomUtil.removeClass(this._container, 'search-load');
 		}
-		else
-		{
-			if(this.options.sourceData)
-				this._retrieveData = this.options.sourceData;
 
-			else if(this.options.url)	//jsonp or ajax
+		// Support synchronous case?
+		if(this.options.geocoder)
+		{
+			var geocoder = this.options.geocoders[this.options.geocoder],
+					formatData = geocoder.formatData;
+
+			this._retrieveData = this._recordsFromAjax;
+
+			// send req
+			this._curReq = this._retrieveData.call(this, inputText, function(data) {
+				var remoteRecords = formatData.call(self, data);
+				// merge record cache
+				self._recordsCache = L.extend(self._recordsCache, remoteRecords);
+				
+				//merge hits
+				records = L.extend(records, remoteRecords);
+
+				self.showTooltip(records);
+				
+				L.DomUtil.removeClass(self._container, 'search-load');
+			}, 5*1000,
+			function (error) {
+				console.error('Request failed: '+error);
+				L.DomUtil.removeClass(self._container, 'search-load');
+			});
+		}
+
+		// network search?
+		if(this.options.url) {	//jsonp or ajax
 				this._retrieveData = this.options.jsonpParam ? this._recordsFromJsonp : this._recordsFromAjax;
 
+			// send req
 			this._curReq = this._retrieveData.call(this, inputText, function(data) {
+				var remoteRecords = self._formatData.call(self, data);
+				// merge record cache
+				self._recordsCache = L.extend(self._recordsCache, remoteRecords);
 				
-				self._recordsCache = self._formatData.call(this, data);
+				//merge hits
+				//records = self._recordsCache; //L.extend(records, self._recordsCache);
+				records = L.extend(records, remoteRecords);
 
 				//TODO refact!
-				if(self.options.sourceData)
-					records = self._filterData( self._input.value, self._recordsCache );
-				else
-					records = self._recordsCache;
+				// if(self.options.sourceData)
+				// 	records = self._filterData( self._input.value, self._recordsCache );
+				// else
 
-				self.showTooltip( records );
+				self.showTooltip(records);
  
 				L.DomUtil.removeClass(self._container, 'search-load');
 			});
 		}
+		// TODO Custom static data with this.options.sourceData
+		// if(this.options.sourceData)
+		// 	this._retrieveData = this.options.sourceData;
+		//}
 	},
 	
 	_handleAutoresize: function() {	//autoresize this._input
